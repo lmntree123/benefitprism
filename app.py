@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import html
 import os
 import secrets
 from urllib.parse import urlencode
@@ -90,7 +91,7 @@ def callback():
     if request.args.get("error"):
         return (
             "Kaiser authorization returned an error: "
-            + request.args.get("error")
+            + html.escape(request.args.get("error"))
         ), 400
 
     returned_state = request.args.get("state")
@@ -131,10 +132,46 @@ def callback():
     token_data = token_response.json()
     access_token = token_data.get("access_token")
 
+    # SMART on FHIR commonly returns the patient launch-context
+    # identifier in the token response.
+    patient_id = token_data.get("patient")
+
     if not access_token:
         return "Kaiser did not return an access token.", 502
 
-    # Ask Kaiser for a small sample of the authorized EOB data.
+    # If Kaiser did not return a patient field, show only the SAFE
+    # field names from the token response so we can determine
+    # where Kaiser placed the patient context.
+    if not patient_id:
+        safe_keys = sorted(
+            key for key in token_data.keys()
+            if key not in {
+                "access_token",
+                "refresh_token",
+                "id_token",
+            }
+        )
+
+        keys_html = "".join(
+            f"<li>{html.escape(str(key))}</li>"
+            for key in safe_keys
+        )
+
+        return f"""
+        <h1>BenefitPrism</h1>
+        <h2>OAuth succeeded, but patient ID was not found.</h2>
+
+        <p>Kaiser returned these non-secret token response fields:</p>
+
+        <ul>
+            {keys_html}
+        </ul>
+
+        <p>No tokens or credentials are displayed.</p>
+        """
+
+    # Kaiser documents patient=[FHIR ID] for retrieving all
+    # ExplanationOfBenefit resources belonging to the member.
     eob_response = requests.get(
         KAISER_EOB_URL,
         headers={
@@ -142,23 +179,22 @@ def callback():
             "Accept": "application/fhir+json",
         },
         params={
+            "patient": patient_id,
             "_include": "*",
-            "_count": "5",
+            "_count": "10",
         },
         timeout=30,
     )
 
-    # We never display or log the access or refresh token.
     session.pop("pkce_verifier", None)
     session.pop("oauth_state", None)
 
     if not eob_response.ok:
         return (
             "<h1>BenefitPrism</h1>"
-            "<h2>Kaiser authorization succeeded.</h2>"
-            "<p>The token exchange worked, but the first "
-            "FHIR EOB request did not.</p>"
+            "<h2>OAuth succeeded, but the EOB request failed.</h2>"
             f"<p>FHIR HTTP status: {eob_response.status_code}</p>"
+            "<p>No OAuth tokens or credentials are displayed.</p>"
         ), 502
 
     bundle = eob_response.json()
@@ -179,28 +215,33 @@ def callback():
             eob_count += 1
 
     types_html = "".join(
-        f"<li>{name}: {count}</li>"
+        f"<li>{html.escape(str(name))}: {count}</li>"
         for name, count in sorted(resource_types.items())
     )
 
     return f"""
     <h1>BenefitPrism</h1>
-    <h2>Kaiser sandbox connection succeeded.</h2>
+    <h2>Kaiser sandbox EOB retrieval succeeded.</h2>
 
-    <p>OAuth authorization: successful</p>
-    <p>Token exchange: successful</p>
-    <p>FHIR request: successful</p>
+    <p>OAuth authorization: <b>successful</b></p>
+    <p>Token exchange: <b>successful</b></p>
+    <p>Patient context received: <b>yes</b></p>
+    <p>FHIR request: <b>successful</b></p>
 
-    <h3>First Kaiser FHIR response</h3>
+    <h3>Kaiser FHIR response</h3>
 
-    <p>ExplanationOfBenefit resources returned: <b>{eob_count}</b></p>
-    <p>Total resources returned in this response: <b>{len(entries)}</b></p>
+    <p>ExplanationOfBenefit resources returned:
+       <b>{eob_count}</b></p>
+
+    <p>Total resources returned:
+       <b>{len(entries)}</b></p>
 
     <ul>
         {types_html}
     </ul>
 
-    <p>No OAuth tokens, credentials, or raw health data are displayed.</p>
+    <p>No OAuth tokens, credentials, patient identifiers,
+       or raw health data are displayed.</p>
     """
 
 
