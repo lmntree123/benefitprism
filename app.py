@@ -19,9 +19,16 @@ KAISER_TOKEN_URL = (
     "https://kpx-service-bus.kp.org/service/kpx/v1/oauth2/token"
 )
 
-KAISER_EOB_URL = (
+# Endpoint shown in Kaiser's sample Postman collection
+FHIR_API_EOB_URL = (
     "https://kpx-service-bus.kp.org/service/cdo/siae/"
     "healthplankpxv1rc/FHIR/api/ExplanationOfBenefit"
+)
+
+# Endpoint pattern documented in Kaiser's resource/search table
+HPEOB_EOB_URL = (
+    "https://kpx-service-bus.kp.org/service/cdo/siae/"
+    "healthplankpxv1rc/FHIR/HPEOB/ExplanationOfBenefit"
 )
 
 SCOPE = (
@@ -41,6 +48,61 @@ def create_pkce():
     )
 
     return verifier, challenge
+
+
+def inspect_fhir_response(response):
+    result = {
+        "status": response.status_code,
+        "resource_type": "Unknown",
+        "entries": None,
+        "total": None,
+    }
+
+    try:
+        data = response.json()
+
+        if isinstance(data, dict):
+            result["resource_type"] = data.get(
+                "resourceType", "Unknown"
+            )
+
+            if isinstance(data.get("entry"), list):
+                result["entries"] = len(data["entry"])
+            elif result["resource_type"] == "Bundle":
+                result["entries"] = 0
+
+            if "total" in data:
+                result["total"] = data.get("total")
+
+    except ValueError:
+        result["resource_type"] = "Non-JSON response"
+
+    return result
+
+
+def result_html(name, result):
+    entries = (
+        str(result["entries"])
+        if result["entries"] is not None
+        else "not provided"
+    )
+
+    total = (
+        str(result["total"])
+        if result["total"] is not None
+        else "not provided"
+    )
+
+    return f"""
+    <div style="margin-bottom:30px;">
+      <h3>{html.escape(name)}</h3>
+      <p>HTTP status: <b>{result["status"]}</b></p>
+      <p>FHIR resource type:
+         <b>{html.escape(str(result["resource_type"]))}</b></p>
+      <p>Entries returned: <b>{entries}</b></p>
+      <p>Bundle total: <b>{total}</b></p>
+    </div>
+    """
 
 
 @app.route("/")
@@ -131,17 +193,11 @@ def callback():
 
     token_data = token_response.json()
     access_token = token_data.get("access_token")
-
-    # SMART on FHIR commonly returns the patient launch-context
-    # identifier in the token response.
     patient_id = token_data.get("patient")
 
     if not access_token:
         return "Kaiser did not return an access token.", 502
 
-    # If Kaiser did not return a patient field, show only the SAFE
-    # field names from the token response so we can determine
-    # where Kaiser placed the patient context.
     if not patient_id:
         safe_keys = sorted(
             key for key in token_data.keys()
@@ -159,89 +215,107 @@ def callback():
 
         return f"""
         <h1>BenefitPrism</h1>
-        <h2>OAuth succeeded, but patient ID was not found.</h2>
-
-        <p>Kaiser returned these non-secret token response fields:</p>
-
-        <ul>
-            {keys_html}
-        </ul>
-
-        <p>No tokens or credentials are displayed.</p>
+        <h2>Patient context not found.</h2>
+        <p>Non-secret token response fields:</p>
+        <ul>{keys_html}</ul>
         """
 
-    # Kaiser documents patient=[FHIR ID] for retrieving all
-    # ExplanationOfBenefit resources belonging to the member.
-    eob_response = requests.get(
-        KAISER_EOB_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/fhir+json",
-        },
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/fhir+json",
+    }
+
+    # Test A:
+    # Kaiser's sample Postman request, without patient filter.
+    test_a = requests.get(
+        FHIR_API_EOB_URL,
+        headers=headers,
         params={
-            "patient": patient_id,
             "_include": "*",
-            "_count": "10",
+            "_count": "5",
         },
         timeout=30,
     )
 
+    # Test B:
+    # Same API endpoint, now with the authorized patient FHIR ID.
+    test_b = requests.get(
+        FHIR_API_EOB_URL,
+        headers=headers,
+        params={
+            "patient": patient_id,
+            "_include": "*",
+            "_count": "5",
+        },
+        timeout=30,
+    )
+
+    # Test C:
+    # HPEOB path documented in Kaiser's EOB search table.
+    test_c = requests.get(
+        HPEOB_EOB_URL,
+        headers=headers,
+        params={
+            "patient": patient_id,
+            "_include": "*",
+            "_count": "5",
+        },
+        timeout=30,
+    )
+
+    result_a = inspect_fhir_response(test_a)
+    result_b = inspect_fhir_response(test_b)
+    result_c = inspect_fhir_response(test_c)
+
     session.pop("pkce_verifier", None)
     session.pop("oauth_state", None)
 
-    if not eob_response.ok:
-        return (
-            "<h1>BenefitPrism</h1>"
-            "<h2>OAuth succeeded, but the EOB request failed.</h2>"
-            f"<p>FHIR HTTP status: {eob_response.status_code}</p>"
-            "<p>No OAuth tokens or credentials are displayed.</p>"
-        ), 502
-
-    bundle = eob_response.json()
-    entries = bundle.get("entry", [])
-
-    resource_types = {}
-    eob_count = 0
-
-    for entry in entries:
-        resource = entry.get("resource", {})
-        resource_type = resource.get("resourceType", "Unknown")
-
-        resource_types[resource_type] = (
-            resource_types.get(resource_type, 0) + 1
-        )
-
-        if resource_type == "ExplanationOfBenefit":
-            eob_count += 1
-
-    types_html = "".join(
-        f"<li>{html.escape(str(name))}: {count}</li>"
-        for name, count in sorted(resource_types.items())
-    )
-
     return f"""
-    <h1>BenefitPrism</h1>
-    <h2>Kaiser sandbox EOB retrieval succeeded.</h2>
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>BenefitPrism FHIR Diagnostics</title>
+    </head>
+    <body style="
+        font-family:Arial,sans-serif;
+        max-width:760px;
+        margin:50px auto;
+        line-height:1.5;
+    ">
 
-    <p>OAuth authorization: <b>successful</b></p>
-    <p>Token exchange: <b>successful</b></p>
-    <p>Patient context received: <b>yes</b></p>
-    <p>FHIR request: <b>successful</b></p>
+      <h1>BenefitPrism</h1>
+      <h2>Kaiser FHIR diagnostics</h2>
 
-    <h3>Kaiser FHIR response</h3>
+      <p>OAuth authorization: <b>successful</b></p>
+      <p>Token exchange: <b>successful</b></p>
+      <p>Patient context received: <b>yes</b></p>
 
-    <p>ExplanationOfBenefit resources returned:
-       <b>{eob_count}</b></p>
+      <hr>
 
-    <p>Total resources returned:
-       <b>{len(entries)}</b></p>
+      {result_html(
+          "Test A — FHIR/api/ExplanationOfBenefit",
+          result_a
+      )}
 
-    <ul>
-        {types_html}
-    </ul>
+      {result_html(
+          "Test B — FHIR/api + patient filter",
+          result_b
+      )}
 
-    <p>No OAuth tokens, credentials, patient identifiers,
-       or raw health data are displayed.</p>
+      {result_html(
+          "Test C — FHIR/HPEOB + patient filter",
+          result_c
+      )}
+
+      <hr>
+
+      <p>
+        No OAuth tokens, credentials, patient identifiers,
+        or raw health data are displayed.
+      </p>
+
+    </body>
+    </html>
     """
 
 
